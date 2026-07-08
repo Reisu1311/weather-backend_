@@ -1,6 +1,6 @@
 import numpy as np
 from lime.lime_tabular import LimeTabularExplainer
-from .preprocessor import FEATURES, HUMAN_LABELS, CLASS_NAMES
+from .preprocessor import FEATURES, HUMAN_LABELS, CLASS_NAMES, LIME_DISPLAY_FEATURES
 
 class LimeService:
     def __init__(self, model_service):
@@ -22,44 +22,55 @@ class LimeService:
 
     def explain(
         self,
-        features          : np.ndarray,
-        feature_values_raw: dict,
+        features           : np.ndarray,
+        feature_values_raw : dict,
         predicted_label    : str,
         top_n              : int = 8,
     ) -> list:
         try:
-            X_scaled = self.model_service.scaler.transform(features)
-
-            # Index kelas yang diprediksi
+            X_scaled  = self.model_service.scaler.transform(features)
             label_idx = list(
                 self.model_service.le.classes_).index(predicted_label)
 
+            # Generate lebih banyak fitur dari LIME
+            # lalu filter hanya yang meteorologis
             exp = self.explainer.explain_instance(
                 data_row    = X_scaled[0],
                 predict_fn  = self.model_service.model.predict_proba,
-                num_features= top_n,
+                num_features= len(FEATURES),  # ambil semua
                 labels      = (label_idx,),
                 num_samples = 500,
             )
 
-            result = []
-            for feat_desc, weight in exp.as_list(label=label_idx):
+            # Filter hanya fitur yang ada di LIME_DISPLAY_FEATURES
+            all_features = exp.as_list(label=label_idx)
+            result       = []
+
+            for feat_desc, weight in all_features:
                 feat_name = self._extract_feat_name(feat_desc)
-                raw_val   = feature_values_raw.get(feat_name, 0)
+
+                # Skip fitur waktu & teknis
+                if feat_name not in LIME_DISPLAY_FEATURES:
+                    continue
+
+                raw_val = feature_values_raw.get(feat_name, 0)
                 result.append({
                     "feature"    : feat_name,
                     "weight"     : round(float(weight), 4),
                     "human_label": HUMAN_LABELS.get(feat_name, feat_name),
                     "value"      : str(round(float(raw_val), 2)),
                 })
+
+                if len(result) >= top_n:
+                    break
+
             return result
+
         except Exception as e:
             print(f"LIME error: {e}")
             return []
 
     def _extract_feat_name(self, desc: str) -> str:
-        # Urutkan dari nama terpanjang agar tidak salah match
-        # misalnya "temperature_2m" vs "temperature_2m_lag1"
         sorted_feats = sorted(FEATURES, key=len, reverse=True)
         for f in sorted_feats:
             if f in desc:
