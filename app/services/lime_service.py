@@ -49,8 +49,7 @@ class LimeService:
                 result.append({
                     "feature"    : feat_name,
                     "weight"     : round(float(weight), 4),
-                    "human_label": HUMAN_LABELS.get(
-                                     feat_name, feat_name),
+                    "human_label": HUMAN_LABELS.get(feat_name, feat_name),
                     "value"      : str(round(float(raw_val), 2)),
                 })
             return result

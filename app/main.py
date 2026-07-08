@@ -4,18 +4,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Inisialisasi services saat startup
 from app.services.model_service import ModelService
 from app.services.lime_service  import LimeService
 
 model_service = ModelService()
 lime_service  = LimeService(model_service)
 
+# Import router predict saja (weather router sudah tidak dipakai)
 from app.routers import predict
 
 app = FastAPI(
-    title      = "Weather Classification API",
-    description= "Klasifikasi kondisi cuaca Makassar — XGBoost + LIME (6 kelas)",
-    version    = "3.0.0",
+    title      = "Weather Prediction API",
+    description= "Forecasting curah hujan Makassar — XGBoost + LIME",
+    version    = "2.0.0",
 )
 
 app.add_middleware(
@@ -32,9 +34,7 @@ app.include_router(
 @app.get("/")
 async def root():
     return {
-        "app"    : "Weather Classification API v3",
+        "app"    : "Weather Prediction API v2",
         "status" : "running",
-        "classes": ["Cerah", "Cerah Berawan", "Berawan Sebagian",
-                    "Berawan Tebal", "Gerimis", "Hujan"],
         "docs"   : "/docs",
     }
