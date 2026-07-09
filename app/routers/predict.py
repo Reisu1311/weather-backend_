@@ -1,6 +1,10 @@
+# FILE: backend/app/routers/predict.py
 from fastapi import APIRouter, HTTPException
 from datetime import datetime
-from ..schemas.prediction import PredictRequest, PredictResponse
+from ..schemas.prediction import (
+    PredictRequest, PredictResponse,
+    PointPredictRequest, PointPredictResponse,
+)
 from ..services.preprocessor import (
     build_features, FEATURES, CLASS_LABEL_ID,
 )
@@ -112,6 +116,74 @@ async def predict(req: PredictRequest):
             hourly_forecast  = hourly_out,
             daily_forecast   = daily_out,
             lime_features    = lime_result,
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/predict/point", response_model=PointPredictResponse)
+async def predict_point(req: PointPredictRequest):
+    try:
+        from ..main import model_service, lime_service
+
+        current = {
+            "temperature_2m"      : req.temperature_2m,
+            "relative_humidity_2m": req.relative_humidity_2m,
+            "dew_point_2m"         : req.dew_point_2m,
+            "surface_pressure"     : req.surface_pressure,
+            "cloud_cover"           : req.cloud_cover,
+            "wind_speed_10m"         : req.wind_speed_10m,
+            "wind_gusts_10m"          : req.wind_gusts_10m,
+        }
+        temp_hist  = req.temp_history     or [req.temperature_2m] * 3
+        hum_hist   = req.humidity_history or [req.relative_humidity_2m] * 3
+        rain_hist  = req.rain_history      or [0.0] * 3
+        cloud_hist = req.cloud_history     or [req.cloud_cover] * 3
+        wind_hist  = req.wind_history       or [req.wind_speed_10m] * 3
+
+        forecast = {
+            "temperature_2m"      : req.forecast_temp,
+            "relative_humidity_2m": req.forecast_humidity,
+            "dew_point_2m"         : req.forecast_dew_point,
+            "surface_pressure"     : req.forecast_pressure,
+            "cloud_cover"           : req.forecast_cloud,
+            "wind_speed_10m"         : req.forecast_wind,
+            "wind_gusts_10m"          : req.forecast_wind_gusts,
+            "rain"                     : req.forecast_rain,
+        }
+
+        # "day" -> ambil jam 12 siang hari itu sbg representasi kondisi dominan
+        if req.target_type == "day":
+            hour_offset = (req.target_index * 24) + 12
+        else:
+            hour_offset = req.target_index + 1
+
+        features, result, target_time = model_service.predict_point(
+            current, temp_hist, hum_hist, rain_hist, cloud_hist, wind_hist,
+            hour_offset=hour_offset, forecast=forecast,
+        )
+
+        feat_values = {
+            FEATURES[i]: float(features[0][i])
+            for i in range(len(FEATURES))
+        }
+        lime_result = lime_service.explain(
+            features, feat_values, result["condition"])
+
+        condition_id = CLASS_LABEL_ID.get(
+            result["condition"], result["condition"])
+        class_proba_id = {
+            CLASS_LABEL_ID.get(k, k): v
+            for k, v in result["class_proba"].items()
+        }
+
+        return PointPredictResponse(
+            label=target_time.strftime("%Y-%m-%d %H:%M"),
+            condition=condition_id,
+            confidence=result["confidence"],
+            class_proba=class_proba_id,
+            lime_features=lime_result,
         )
 
     except Exception as e:

@@ -1,3 +1,4 @@
+# FILE: backend/app/schemas/prediction.py
 from pydantic import BaseModel
 from typing import List, Dict
 
@@ -57,3 +58,16 @@ class PredictResponse(BaseModel):
     hourly_forecast  : List[HourlyPrediction]
     daily_forecast   : List[DailyPrediction]
     lime_features    : List[LimeFeature]
+
+
+# ── Prediksi + LIME untuk SATU titik waktu (dipakai layar Per Jam & Per Hari) ──
+class PointPredictRequest(PredictRequest):
+    target_type : str  # "hour" atau "day"
+    target_index: int  # index ke-berapa (0-based) dari hourly_forecast / daily_forecast
+
+class PointPredictResponse(BaseModel):
+    label        : str
+    condition    : str
+    confidence   : float
+    class_proba  : Dict[str, float]
+    lime_features: List[LimeFeature]

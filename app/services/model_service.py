@@ -1,3 +1,4 @@
+# FILE: backend/app/services/model_service.py
 import joblib
 import numpy as np
 from pathlib import Path
@@ -175,3 +176,85 @@ class ModelService:
                 "confidence": avg_confidence,
             })
         return daily
+
+    def predict_point(
+        self,
+        owm_current  : dict,
+        temp_history : list,
+        hum_history  : list,
+        rain_history : list,
+        cloud_history: list,
+        wind_history : list,
+        hour_offset  : int,
+        forecast     : dict | None = None,
+    ):
+        """Hitung fitur (40 fitur) + hasil prediksi untuk SATU titik waktu
+        tertentu (hour_offset jam ke depan dari sekarang). Dipakai untuk
+        menjelaskan (LIME) satu jam/hari spesifik tanpa perlu menghitung
+        LIME untuk semua 24x7 titik sekaligus (berat).
+
+        Mengembalikan tuple: (features, result, target_time)
+        - features    : np.ndarray (1, n_fitur) — dipakai untuk LIME
+        - result      : dict {condition, confidence, class_proba}
+        - target_time : datetime waktu yang dijelaskan
+        """
+        from .preprocessor import build_features
+
+        forecast = forecast or {}
+
+        def forecast_at(key: str, idx: int, fallback: float) -> float:
+            arr = forecast.get(key) or []
+            if idx < len(arr):
+                return float(arr[idx])
+            return fallback
+
+        temp_hist  = list(temp_history)
+        hum_hist   = list(hum_history)
+        rain_hist  = list(rain_history)
+        cloud_hist = list(cloud_history)
+        wind_hist  = list(wind_history)
+        now        = datetime.now()
+
+        features    = None
+        target_time = now
+
+        for h in range(1, hour_offset + 1):
+            idx         = h - 1
+            target_time = now + timedelta(hours=h)
+
+            hour_weather = {
+                "temperature_2m": forecast_at(
+                    "temperature_2m", idx, owm_current.get("temperature_2m", 27.0)),
+                "relative_humidity_2m": forecast_at(
+                    "relative_humidity_2m", idx,
+                    owm_current.get("relative_humidity_2m", 80.0)),
+                "dew_point_2m": forecast_at(
+                    "dew_point_2m", idx, owm_current.get("dew_point_2m", 22.0)),
+                "surface_pressure": forecast_at(
+                    "surface_pressure", idx,
+                    owm_current.get("surface_pressure", 1010.0)),
+                "cloud_cover": forecast_at(
+                    "cloud_cover", idx, owm_current.get("cloud_cover", 50.0)),
+                "wind_speed_10m": forecast_at(
+                    "wind_speed_10m", idx,
+                    owm_current.get("wind_speed_10m", 10.0)),
+                "wind_gusts_10m": forecast_at(
+                    "wind_gusts_10m", idx,
+                    owm_current.get("wind_gusts_10m", 15.0)),
+            }
+            hour_rain = forecast_at("rain", idx, 0.0)
+
+            features = build_features(
+                hour_weather, temp_hist, hum_hist,
+                rain_hist, cloud_hist, wind_hist,
+                target_time,
+            )
+
+            temp_hist.insert(0, hour_weather["temperature_2m"])
+            hum_hist.insert(0,  hour_weather["relative_humidity_2m"])
+            rain_hist.insert(0, hour_rain)
+            cloud_hist.insert(0, hour_weather["cloud_cover"])
+            wind_hist.insert(0, hour_weather["wind_speed_10m"])
+
+        result = self.predict(features)
+        return features, result, target_time
