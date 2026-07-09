@@ -18,6 +18,20 @@ class PredictRequest(BaseModel):
     rain_history     : List[float] = []
     cloud_history    : List[float] = []
     wind_history      : List[float] = []
+    # Forecast ASLI per jam ke depan dari Open-Meteo (dikirim Flutter).
+    # index 0 = 1 jam dari sekarang, index 1 = 2 jam dari sekarang, dst.
+    # Dipakai supaya prediksi per jam & harian benar-benar mengikuti
+    # kondisi cuaca yang diramalkan per jam, bukan mengulang nilai
+    # "current" terus-menerus (yang sebelumnya membuat hasil prediksi
+    # per jam & harian selalu sama dengan prediksi saat ini).
+    forecast_temp       : List[float] = []
+    forecast_humidity   : List[float] = []
+    forecast_dew_point  : List[float] = []
+    forecast_pressure   : List[float] = []
+    forecast_cloud      : List[float] = []
+    forecast_wind       : List[float] = []
+    forecast_wind_gusts : List[float] = []
+    forecast_rain       : List[float] = []
 
 class LimeFeature(BaseModel):
     feature    : str

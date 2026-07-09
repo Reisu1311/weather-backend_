@@ -1,9 +1,7 @@
 import joblib
 import numpy as np
-import math
 from pathlib import Path
 from datetime import datetime, timedelta
-from collections import Counter
 
 MODEL_DIR = Path(__file__).parent.parent / "models"
 
@@ -16,51 +14,23 @@ class ModelService:
         print(f"   Kelas: {list(self.le.classes_)}")
 
     def predict(self, features: np.ndarray) -> dict:
+        """Klasifikasi kondisi cuaca dari 40 fitur"""
         X_scaled = self.scaler.transform(features)
         pred_idx = int(self.model.predict(X_scaled)[0])
         proba    = self.model.predict_proba(X_scaled)[0]
-        label    = str(self.le.inverse_transform([pred_idx])[0])
+
+        label = str(self.le.inverse_transform([pred_idx])[0])
+
         class_proba = {
             str(self.le.inverse_transform([i])[0]): float(p)
             for i, p in enumerate(proba)
         }
+
         return {
             "condition"  : label,
             "confidence" : float(proba.max()),
             "class_proba": class_proba,
         }
-
-    def _estimate_rain(self, condition: str) -> float:
-        """Estimasi curah hujan berdasarkan kondisi terprediksi."""
-        if condition == "Rain":
-            return 2.5
-        elif condition == "Drizzle":
-            return 0.5
-        return 0.0
-
-    def _estimate_cloud(self, condition: str, prev_cloud: float) -> float:
-        """Estimasi tutupan awan berikutnya berdasarkan kondisi."""
-        if condition in ["Clear Sky"]:
-            return max(5.0, prev_cloud - 8.0)
-        elif condition in ["Mainly Clear"]:
-            return max(15.0, prev_cloud - 4.0)
-        elif condition in ["Partly Cloudy"]:
-            # Konvergensi ke 50%
-            return prev_cloud + (50.0 - prev_cloud) * 0.2
-        elif condition in ["Overcast"]:
-            return min(100.0, prev_cloud + 4.0)
-        elif condition in ["Drizzle", "Rain"]:
-            return min(100.0, prev_cloud + 5.0)
-        return prev_cloud
-
-    def _diurnal_temp(self, base_temp: float, hour: int) -> float:
-        """
-        Estimasi variasi suhu diurnal tropis.
-        Puncak ~14:00, minimum ~05:00.
-        Amplitudo ~3°C.
-        """
-        angle = 2 * math.pi * (hour - 5) / 24
-        return base_temp + 1.5 * math.sin(angle)
 
     def predict_multi_hour(
         self,
@@ -71,8 +41,39 @@ class ModelService:
         cloud_history: list,
         wind_history : list,
         hours        : int = 24,
+        forecast     : dict | None = None,
     ) -> list:
+        """Prediksi kondisi cuaca per jam (autoregressive).
+
+        `forecast` (opsional) berisi data forecast ASLI per jam ke depan
+        dari Open-Meteo, mis:
+            {
+            "temperature_2m"      : [t+1, t+2, ...],
+            "relative_humidity_2m": [...],
+            "dew_point_2m"         : [...],
+            "surface_pressure"     : [...],
+            "cloud_cover"           : [...],
+            "wind_speed_10m"         : [...],
+            "wind_gusts_10m"          : [...],
+            "rain"                    : [...],
+            }
+        Jika tersedia, nilai per jam ini dipakai langsung sebagai fitur
+        cuaca untuk jam tersebut (bukan mengulang nilai `owm_current`),
+        sehingga hasil prediksi per jam benar-benar mengikuti kondisi
+        yang diramalkan. Jika forecast tidak tersedia untuk suatu jam
+        (mis. request lama tanpa data forecast, atau melebihi rentang
+        forecast yang dikirim), jam tersebut fallback ke pendekatan lama
+        (pakai `owm_current`) supaya tetap kompatibel/tidak error.
+        """
         from .preprocessor import build_features
+
+        forecast = forecast or {}
+
+        def forecast_at(key: str, idx: int, fallback: float) -> float:
+            arr = forecast.get(key) or []
+            if idx < len(arr):
+                return float(arr[idx])
+            return fallback
 
         results    = []
         temp_hist  = list(temp_history)
@@ -82,39 +83,36 @@ class ModelService:
         wind_hist  = list(wind_history)
         now        = datetime.now()
 
-        # Nilai awal dari data cuaca saat ini
-        base_temp  = owm_current.get("temperature_2m", 27.0)
-        prev_hum   = owm_current.get("relative_humidity_2m", 80.0)
-        prev_cloud = owm_current.get("cloud_cover", 50.0)
-        prev_wind  = owm_current.get("wind_speed_10m", 10.0)
-
         for h in range(1, hours + 1):
+            idx         = h - 1
             future_time = now + timedelta(hours=h)
 
-            # Estimasi nilai fitur untuk jam ini
-            est_temp  = self._diurnal_temp(base_temp, future_time.hour)
-            est_cloud = prev_cloud
-            est_hum   = prev_hum
-
-            # Kelembaban cenderung naik malam hari
-            if future_time.hour >= 20 or future_time.hour <= 5:
-                est_hum = min(95.0, prev_hum + 1.5)
-            elif 10 <= future_time.hour <= 16:
-                est_hum = max(50.0, prev_hum - 1.0)
-
-            current_for_hour = {
-                "temperature_2m"      : est_temp,
-                "relative_humidity_2m": est_hum,
-                "dew_point_2m"        : owm_current.get("dew_point_2m", 22.0),
-                "surface_pressure"    : owm_current.get("surface_pressure", 1010.0),
-                "cloud_cover"         : est_cloud,
-                "wind_speed_10m"      : prev_wind,
-                "wind_gusts_10m"      : owm_current.get("wind_gusts_10m", 15.0),
+            # Nilai cuaca untuk jam ini: pakai forecast asli kalau ada,
+            # kalau tidak fallback ke snapshot current (pendekatan lama).
+            hour_weather = {
+                "temperature_2m": forecast_at(
+                    "temperature_2m", idx, owm_current.get("temperature_2m", 27.0)),
+                "relative_humidity_2m": forecast_at(
+                    "relative_humidity_2m", idx,
+                    owm_current.get("relative_humidity_2m", 80.0)),
+                "dew_point_2m": forecast_at(
+                    "dew_point_2m", idx, owm_current.get("dew_point_2m", 22.0)),
+                "surface_pressure": forecast_at(
+                    "surface_pressure", idx,
+                    owm_current.get("surface_pressure", 1010.0)),
+                "cloud_cover": forecast_at(
+                    "cloud_cover", idx, owm_current.get("cloud_cover", 50.0)),
+                "wind_speed_10m": forecast_at(
+                    "wind_speed_10m", idx,
+                    owm_current.get("wind_speed_10m", 10.0)),
+                "wind_gusts_10m": forecast_at(
+                    "wind_gusts_10m", idx,
+                    owm_current.get("wind_gusts_10m", 15.0)),
             }
+            hour_rain = forecast_at("rain", idx, 0.0)
 
             feats  = build_features(
-                current_for_hour,
-                temp_hist, hum_hist,
+                hour_weather, temp_hist, hum_hist,
                 rain_hist, cloud_hist, wind_hist,
                 future_time,
             )
@@ -127,27 +125,15 @@ class ModelService:
                 "confidence": result["confidence"],
             })
 
-            # Estimasi nilai untuk iterasi berikutnya
-            est_rain  = self._estimate_rain(result["condition"])
-            next_cloud = self._estimate_cloud(result["condition"], est_cloud)
-
-            # Geser histori dengan nilai estimasi jam ini
-            temp_hist.insert(0, est_temp)
-            hum_hist.insert(0, est_hum)
-            rain_hist.insert(0, est_rain)
-            cloud_hist.insert(0, est_cloud)
-            wind_hist.insert(0, prev_wind)
-
-            # Potong histori agar tidak terlalu panjang
-            temp_hist  = temp_hist[:6]
-            hum_hist   = hum_hist[:6]
-            rain_hist  = rain_hist[:6]
-            cloud_hist = cloud_hist[:6]
-            wind_hist  = wind_hist[:6]
-
-            # Update untuk iterasi berikutnya
-            prev_cloud = next_cloud
-            prev_hum   = est_hum
+            # Geser history pakai nilai jam ini yang BARU SAJA dipakai
+            # (forecast asli kalau ada), bukan selalu owm_current —
+            # supaya fitur lag/rolling mencerminkan tren cuaca yang
+            # sesungguhnya diramalkan, bukan garis datar.
+            temp_hist.insert(0, hour_weather["temperature_2m"])
+            hum_hist.insert(0,  hour_weather["relative_humidity_2m"])
+            rain_hist.insert(0, hour_rain)
+            cloud_hist.insert(0, hour_weather["cloud_cover"])
+            wind_hist.insert(0, hour_weather["wind_speed_10m"])
 
         return results
 
@@ -160,11 +146,13 @@ class ModelService:
         cloud_history: list,
         wind_history : list,
         days         : int = 7,
+        forecast     : dict | None = None,
     ) -> list:
+        """Prediksi kondisi cuaca harian (ambil mode/dominan dari 24 jam)"""
         hourly = self.predict_multi_hour(
             owm_current, temp_history, hum_history,
             rain_history, cloud_history, wind_history,
-            hours=days * 24,
+            hours=days * 24, forecast=forecast,
         )
 
         now   = datetime.now()
@@ -172,10 +160,13 @@ class ModelService:
         for d in range(days):
             day_data   = hourly[d * 24 : (d + 1) * 24]
             conditions = [h["condition"] for h in day_data]
-            # Kondisi dominan (modus)
+
+            # Ambil kondisi paling sering muncul (mode) di hari itu
+            from collections import Counter
             condition_dominan = Counter(conditions).most_common(1)[0][0]
             avg_confidence    = float(np.mean(
                 [h["confidence"] for h in day_data]))
+
             future_day = now + timedelta(days=d + 1)
             daily.append({
                 "day"       : future_day.strftime("%A"),
