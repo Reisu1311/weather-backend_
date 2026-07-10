@@ -1,6 +1,6 @@
 # FILE: backend/app/routers/predict.py
 from fastapi import APIRouter, HTTPException
-from datetime import datetime
+from datetime import datetime, timedelta
 from ..schemas.prediction import (
     PredictRequest, PredictResponse,
     PointPredictRequest, PointPredictResponse,
@@ -153,9 +153,31 @@ async def predict_point(req: PointPredictRequest):
             "rain"                     : req.forecast_rain,
         }
 
-        # "day" -> ambil jam 12 siang hari itu sbg representasi kondisi dominan
+        # "day" -> ambil jam 12:00 SIANG (kalender) pada tanggal target
+        # sebagai representasi kondisi dominan hari itu.
+        #
+        # Bug fix: sebelumnya `hour_offset = target_index*24 + 12` dihitung
+        # relatif dari waktu SAAT REQUEST dibuat (now), bukan relatif dari
+        # kalender. Akibatnya "jam 12 siang" bisa meleset jauh dari jam 12
+        # siang yang sesungguhnya tergantung jam berapa user membuka app --
+        # misal kalau dibuka jam 08:00, target_index=0 (besok) malah
+        # menghitung ke jam 20:00 HARI INI, bukan jam 12:00 besok. Ini juga
+        # tidak konsisten dengan `date` yang dikembalikan oleh
+        # predict_multi_day (yang sudah dihitung berbasis tanggal kalender
+        # via `future_day = now + timedelta(days=d+1)`).
+        #
+        # Sekarang dihitung berbasis tanggal kalender yang sama persis
+        # dengan yang dipakai predict_multi_day, supaya popup LIME di
+        # Flutter (yang juga mencari titik jam 12:00 di tanggal kalender
+        # yang sama) selalu menjelaskan titik waktu yang benar-benar sama
+        # dengan yang ditampilkan.
+        now = datetime.now()
         if req.target_type == "day":
-            hour_offset = (req.target_index * 24) + 12
+            target_date = (now + timedelta(days=req.target_index + 1)).date()
+            target_noon = datetime.combine(
+                target_date, datetime.min.time()) + timedelta(hours=12)
+            hour_offset = max(1, round(
+                (target_noon - now).total_seconds() / 3600))
         else:
             hour_offset = req.target_index + 1
 
