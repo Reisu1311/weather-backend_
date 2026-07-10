@@ -149,31 +149,79 @@ class ModelService:
         days         : int = 7,
         forecast     : dict | None = None,
     ) -> list:
-        """Prediksi kondisi cuaca harian (ambil mode/dominan dari 24 jam)"""
+        """Prediksi kondisi cuaca harian.
+
+        Diambil dari TITIK jam 12:00 siang (kalender) hari itu -- metode
+        yang SAMA PERSIS dengan `predict_point` (target_type="day") di
+        router. Ini penting: sebelumnya fungsi ini mengambil MODE (kondisi
+        paling sering muncul) dari rolling window 24 jam yang dihitung
+        mulai dari SAAT REQUEST dibuat (bukan dari tengah malam kalender),
+        yang seringkali berbeda dari titik jam 12 siang yang dijelaskan
+        popup LIME -- menyebabkan daftar "Prediksi Cuaca Per Hari" bisa
+        menampilkan mis. "Mendung" sementara popup detail (yang diklik
+        user) menunjukkan "Cerah" untuk hari yang sama.
+        """
+        from collections import Counter
+
+        now = datetime.now()
+
+        # Hitung cukup jauh ke depan supaya mencakup jam 12:00 di hari
+        # terakhir yang diminta.
+        last_day_date = (now + timedelta(days=days)).date()
+        last_noon = datetime.combine(
+            last_day_date, datetime.min.time()) + timedelta(hours=12)
+        max_hour_offset = max(1, round(
+            (last_noon - now).total_seconds() / 3600))
+
         hourly = self.predict_multi_hour(
             owm_current, temp_history, hum_history,
             rain_history, cloud_history, wind_history,
-            hours=days * 24, forecast=forecast,
+            hours=max_hour_offset, forecast=forecast,
         )
 
-        now   = datetime.now()
         daily = []
         for d in range(days):
-            day_data   = hourly[d * 24 : (d + 1) * 24]
-            conditions = [h["condition"] for h in day_data]
+            future_day  = now + timedelta(days=d + 1)
+            target_date = future_day.date()
 
-            # Ambil kondisi paling sering muncul (mode) di hari itu
-            from collections import Counter
-            condition_dominan = Counter(conditions).most_common(1)[0][0]
-            avg_confidence    = float(np.mean(
-                [h["confidence"] for h in day_data]))
+            # Cari entri jam 12:00 TEPAT pada tanggal target.
+            point = None
+            for h in hourly:
+                h_dt = datetime.fromisoformat(h["datetime"])
+                if h_dt.date() == target_date and h_dt.hour == 12:
+                    point = h
+                    break
 
-            future_day = now + timedelta(days=d + 1)
+            # Fallback: kalau titik jam 12 persis tidak ada (jarang --
+            # hanya kalau rentang forecast terlalu pendek), ambil entri
+            # terdekat pada tanggal yang sama; kalau tetap tidak ada,
+            # fallback ke mode 24-jam seperti pendekatan lama.
+            if point is None:
+                closest, closest_diff = None, 999
+                for h in hourly:
+                    h_dt = datetime.fromisoformat(h["datetime"])
+                    if h_dt.date() == target_date:
+                        diff = abs(h_dt.hour - 12)
+                        if diff < closest_diff:
+                            closest_diff = diff
+                            closest = h
+                point = closest
+
+            if point is not None:
+                condition  = point["condition"]
+                confidence = point["confidence"]
+            else:
+                day_data   = hourly[d * 24 : (d + 1) * 24]
+                conditions = [h["condition"] for h in day_data] or ["Cerah Berawan"]
+                condition  = Counter(conditions).most_common(1)[0][0]
+                confidence = float(np.mean(
+                    [h["confidence"] for h in day_data])) if day_data else 0.5
+
             daily.append({
                 "day"       : future_day.strftime("%A"),
-                "date"      : future_day.strftime("%Y-%m-%d"),
-                "condition" : condition_dominan,
-                "confidence": avg_confidence,
+                "date"      : target_date.strftime("%Y-%m-%d"),
+                "condition" : condition,
+                "confidence": confidence,
             })
         return daily
 
