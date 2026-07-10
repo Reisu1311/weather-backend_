@@ -25,7 +25,7 @@ class LimeService:
         features           : np.ndarray,
         feature_values_raw : dict,
         predicted_label    : str,
-        top_n              : int = 8,
+        top_n              : int = 10,
     ) -> list:
         try:
             X_scaled  = self.model_service.scaler.transform(features)
