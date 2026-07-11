@@ -3,6 +3,7 @@ import joblib
 import numpy as np
 from pathlib import Path
 from datetime import datetime, timedelta
+from collections import Counter
 
 MODEL_DIR = Path(__file__).parent.parent / "models"
 
@@ -136,7 +137,66 @@ class ModelService:
             cloud_hist.insert(0, hour_weather["cloud_cover"])
             wind_hist.insert(0, hour_weather["wind_speed_10m"])
 
+        # Haluskan lompatan 1-jam yang "nyempil sendirian" di antara jam-jam
+        # yang konsisten (mis. Mendung,Mendung,Cerah,Mendung,Mendung ->
+        # jam "Cerah" itu ditarik jadi Mendung). Perubahan cuaca beneran
+        # yang berlangsung 2 jam atau lebih TIDAK disentuh -- lihat
+        # docstring _smooth_hourly untuk detail.
+        results = self._smooth_hourly(results, window=3)
+
         return results
+
+    def _smooth_hourly(self, results: list, window: int = 3) -> list:
+        """Haluskan noise klasifikasi per-jam (majority vote antar-tetangga).
+
+        Setiap jam diprediksi SECARA INDEPENDEN dari fitur cuaca jam itu
+        saja (tidak ada "memori" hasil klasifikasi jam sebelumnya). Kalau
+        nilai cloud_cover/kelembaban dari forecast Open-Meteo di satu jam
+        kebetulan sedikit melewati ambang batas keputusan model, hasilnya
+        bisa "lompat" sendirian lalu balik lagi 1 jam kemudian -- misal
+        Mendung,Mendung,Mendung,Cerah,Mendung,Mendung. Secara matematis
+        model tidak salah (memang begitu isi datanya jam itu), tapi
+        secara meteorologi & dari sisi tampilan ke user ini terlihat
+        "kedip-kedip" dan membingungkan, karena cuaca nyata jarang
+        berubah total lalu balik lagi hanya dalam 1 jam.
+
+        Untuk tiap jam, lihat jendela [jam-1, jam ini, jam+1] (window=3).
+        Kalau kondisi jam ini KALAH SUARA dibanding mayoritas jendela itu
+        (mis. 2 dari 3 tetangga bilang "Mendung", cuma jam ini "Cerah"),
+        kondisi jam ini ditarik ikut mayoritas, dan confidence-nya diganti
+        jadi rata-rata confidence entri yang kondisinya sama dengan hasil
+        mayoritas tersebut (bukan confidence dari kondisi lama yang sudah
+        dibuang).
+
+        Perubahan yang berlangsung 2 jam berturut-turut atau lebih TIDAK
+        disentuh -- itu dianggap perubahan cuaca yang genuine, bukan noise
+        (karena tidak akan pernah kalah suara 2-lawan-1 di jendela manapun).
+        """
+        if window < 3 or len(results) < window:
+            return results
+
+        half     = window // 2
+        smoothed = [dict(r) for r in results]
+
+        for i in range(len(results)):
+            lo = max(0, i - half)
+            hi = min(len(results), i + half + 1)
+            neighborhood = results[lo:hi]
+            if len(neighborhood) < window:
+                continue  # dekat ujung data, tetangga tak lengkap -> biarkan
+
+            counts = Counter(h["condition"] for h in neighborhood)
+            top_condition, top_count = counts.most_common(1)[0]
+
+            if top_condition != results[i]["condition"] and top_count > window / 2:
+                matching_conf = [
+                    h["confidence"] for h in neighborhood
+                    if h["condition"] == top_condition
+                ]
+                smoothed[i]["condition"]  = top_condition
+                smoothed[i]["confidence"] = float(np.mean(matching_conf))
+
+        return smoothed
 
     def predict_multi_day(
         self,
@@ -161,8 +221,6 @@ class ModelService:
         menampilkan mis. "Mendung" sementara popup detail (yang diklik
         user) menunjukkan "Cerah" untuk hari yang sama.
         """
-        from collections import Counter
-
         now = datetime.now()
 
         # Hitung cukup jauh ke depan supaya mencakup jam 12:00 di hari
@@ -235,11 +293,28 @@ class ModelService:
         wind_history : list,
         hour_offset  : int,
         forecast     : dict | None = None,
+        smooth       : bool = True,
     ):
         """Hitung fitur (40 fitur) + hasil prediksi untuk SATU titik waktu
         tertentu (hour_offset jam ke depan dari sekarang). Dipakai untuk
         menjelaskan (LIME) satu jam/hari spesifik tanpa perlu menghitung
         LIME untuk semua 24x7 titik sekaligus (berat).
+
+        Konsistensi dengan daftar per jam/harian (PENTING):
+        `predict_multi_hour` sudah menghaluskan noise klasifikasi 1-jam
+        (lihat `_smooth_hourly`). Kalau fungsi ini TIDAK ikut menghaluskan
+        dengan cara yang sama, popup LIME (yang pakai fungsi ini) bisa
+        menampilkan kondisi mentah yang BERBEDA dari yang sudah tampil di
+        daftar per jam/harian untuk jam yang sama persis -- memunculkan
+        lagi masalah "list vs popup tidak sinkron" yang pernah terjadi.
+
+        Karena itu, saat `smooth=True` (default), fungsi ini juga
+        menghitung prediksi di (hour_offset-1) dan (hour_offset+1) lewat
+        jalur autoregressive yang sama, lalu menerapkan voting mayoritas
+        3-jam yang identik dengan `_smooth_hourly`. Fitur (untuk LIME)
+        tetap diambil dari titik hour_offset yang sesungguhnya -- yang
+        berubah hanya label "condition"/"confidence" yang ditampilkan
+        (dan otomatis ikut menentukan kelas apa yang dijelaskan LIME).
 
         Mengembalikan tuple: (features, result, target_time)
         - features    : np.ndarray (1, n_fitur) — dipakai untuk LIME
@@ -263,12 +338,18 @@ class ModelService:
         wind_hist  = list(wind_history)
         now        = datetime.now()
 
-        features    = None
-        target_time = now
+        # Kalau smoothing aktif, kita perlu lanjut 1 jam lagi setelah
+        # hour_offset supaya bisa tahu prediksi tetangga (hour_offset+1).
+        last_h = hour_offset + 1 if smooth else hour_offset
 
-        for h in range(1, hour_offset + 1):
+        target_features = None
+        target_result   = None
+        target_time     = now
+        window_results: dict[int, dict] = {}
+
+        for h in range(1, last_h + 1):
             idx         = h - 1
-            target_time = now + timedelta(hours=h)
+            future_time = now + timedelta(hours=h)
 
             hour_weather = {
                 "temperature_2m": forecast_at(
@@ -292,11 +373,23 @@ class ModelService:
             }
             hour_rain = forecast_at("rain", idx, 0.0)
 
-            features = build_features(
+            feats  = build_features(
                 hour_weather, temp_hist, hum_hist,
                 rain_hist, cloud_hist, wind_hist,
-                target_time,
+                future_time,
             )
+            result = self.predict(feats)
+
+            if h in (hour_offset - 1, hour_offset, hour_offset + 1):
+                window_results[h] = {
+                    "condition" : result["condition"],
+                    "confidence": result["confidence"],
+                }
+
+            if h == hour_offset:
+                target_features = feats
+                target_result   = result
+                target_time     = future_time
 
             temp_hist.insert(0, hour_weather["temperature_2m"])
             hum_hist.insert(0,  hour_weather["relative_humidity_2m"])
@@ -304,5 +397,29 @@ class ModelService:
             cloud_hist.insert(0, hour_weather["cloud_cover"])
             wind_hist.insert(0, hour_weather["wind_speed_10m"])
 
-        result = self.predict(features)
-        return features, result, target_time
+        final_result = dict(target_result)
+
+        # Voting mayoritas 3-jam (sama seperti _smooth_hourly). Hanya
+        # dilakukan kalau kedua tetangga (sebelum & sesudah) tersedia --
+        # kalau hour_offset==1 (tidak ada "sebelum"), dibiarkan apa adanya,
+        # sama seperti perlakuan _smooth_hourly di ujung data.
+        if (smooth
+                and (hour_offset - 1) in window_results
+                and (hour_offset + 1) in window_results):
+            neighborhood = [
+                window_results[hour_offset - 1],
+                window_results[hour_offset],
+                window_results[hour_offset + 1],
+            ]
+            counts = Counter(r["condition"] for r in neighborhood)
+            top_condition, top_count = counts.most_common(1)[0]
+
+            if top_condition != final_result["condition"] and top_count > 1:
+                matching_conf = [
+                    r["confidence"] for r in neighborhood
+                    if r["condition"] == top_condition
+                ]
+                final_result["condition"]  = top_condition
+                final_result["confidence"] = float(np.mean(matching_conf))
+
+        return target_features, final_result, target_time
