@@ -5,6 +5,25 @@ from typing import List, Dict
 class PredictRequest(BaseModel):
     lat              : float
     lon              : float
+    # Jam SAAT INI di HP pengguna (ISO 8601, mis. "2026-07-17T14:04:00").
+    #
+    # PENTING: backend (server Render) dan HP pengguna bisa berada di
+    # timezone yang BEDA (server biasanya UTC, HP di WIB/UTC+7). Kalau
+    # backend memakai jamnya SENDIRI (`datetime.now()`) untuk menghitung
+    # "jam berapa sekarang" / "jam 12 siang besok itu berapa jam lagi",
+    # hasilnya bisa meleset berjam-jam dari yang sebenarnya, karena:
+    #  1) Fitur "hour"/"hour_sin"/"hour_cos" yang dikirim ke model jadi
+    #     salah (memakai jam server, bukan jam lokal yang sebenarnya).
+    #  2) Titik "jam 12 siang" untuk popup harian bisa menunjuk ke index
+    #     array forecast yang salah (array itu disusun Flutter mulai
+    #     dari JAM DI HP, bukan jam server) -- inilah yang menyebabkan
+    #     nilai "Suhu" di LIME (mis. 29.2°C) berbeda dari suhu jam 12:00
+    #     yang ditampilkan di header popup (mis. 30.6°C).
+    #
+    # Kalau field ini tidak dikirim (klien lama), backend fallback pakai
+    # jamnya sendiri seperti sebelumnya -- tetap jalan, cuma berpotensi
+    # kurang presisi seperti dijelaskan di atas.
+    client_now: str | None = None
     # Data cuaca realtime dari Open-Meteo (dikirim Flutter)
     temperature_2m       : float = 27.0
     relative_humidity_2m : float = 80.0

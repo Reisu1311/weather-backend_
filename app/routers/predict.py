@@ -16,6 +16,16 @@ async def predict(req: PredictRequest):
     try:
         from ..main import model_service, lime_service
 
+        # Model masih loading di background (lihat lifespan di main.py) --
+        # beri pesan jelas (503) alih-alih error internal yang membingungkan
+        # kalau ada request masuk tepat di jendela singkat sebelum model
+        # selesai dimuat.
+        if model_service is None or lime_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Model masih dimuat, coba lagi dalam beberapa saat.",
+            )
+
         # 1. Data cuaca saat ini (dari Open-Meteo via Flutter)
         current = {
             "temperature_2m"      : req.temperature_2m,
@@ -34,7 +44,15 @@ async def predict(req: PredictRequest):
         cloud_hist = req.cloud_history     or [req.cloud_cover] * 3
         wind_hist  = req.wind_history       or [req.wind_speed_10m] * 3
 
-        now = datetime.now()
+        # Bug fix: pakai jam yang dikirim HP (client_now), bukan jam
+        # server -- lihat penjelasan lengkap di
+        # `PredictRequest.client_now` (schemas/prediction.py). Kalau
+        # klien lama belum mengirim field ini, fallback ke jam server
+        # seperti sebelumnya (tetap jalan, cuma kurang presisi).
+        try:
+            now = datetime.fromisoformat(req.client_now) if req.client_now else datetime.now()
+        except ValueError:
+            now = datetime.now()
 
         # 3. Build fitur (40 fitur) untuk prediksi SAAT INI
         features = build_features(
@@ -63,7 +81,7 @@ async def predict(req: PredictRequest):
         hourly_raw = model_service.predict_multi_hour(
             current, temp_hist, hum_hist,
             rain_hist, cloud_hist, wind_hist, hours=24,
-            forecast=forecast,
+            forecast=forecast, now=now,
         )
         hourly_out = [
             {
@@ -79,7 +97,7 @@ async def predict(req: PredictRequest):
         daily_raw = model_service.predict_multi_day(
             current, temp_hist, hum_hist,
             rain_hist, cloud_hist, wind_hist, days=7,
-            forecast=forecast,
+            forecast=forecast, now=now,
         )
         daily_out = [
             {
@@ -118,6 +136,8 @@ async def predict(req: PredictRequest):
             lime_features    = lime_result,
         )
 
+    except HTTPException:
+        raise  # biarkan status code sengaja (mis. 503 model masih loading) apa adanya
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -126,6 +146,12 @@ async def predict(req: PredictRequest):
 async def predict_point(req: PointPredictRequest):
     try:
         from ..main import model_service, lime_service
+
+        if model_service is None or lime_service is None:
+            raise HTTPException(
+                status_code=503,
+                detail="Model masih dimuat, coba lagi dalam beberapa saat.",
+            )
 
         current = {
             "temperature_2m"      : req.temperature_2m,
@@ -171,7 +197,20 @@ async def predict_point(req: PointPredictRequest):
         # Flutter (yang juga mencari titik jam 12:00 di tanggal kalender
         # yang sama) selalu menjelaskan titik waktu yang benar-benar sama
         # dengan yang ditampilkan.
-        now = datetime.now()
+        #
+        # Bug fix TAMBAHAN: `now` di sini WAJIB pakai jam HP pengguna
+        # (client_now), bukan jam server. Kalau pakai jam server (biasa
+        # UTC, beda ~7 jam dari WIB), titik "jam 12:00" yang dihitung di
+        # atas bisa menunjuk ke index yang salah di array `forecast`
+        # (array itu disusun Flutter mulai dari jam DI HP) -- inilah
+        # sebabnya nilai fitur "Suhu" di LIME (mis. 29.2°C) bisa berbeda
+        # dari suhu jam 12:00 yang ditampilkan di header popup
+        # (mis. 30.6°C): keduanya sebenarnya menjelaskan JAM YANG BEDA.
+        try:
+            now = datetime.fromisoformat(req.client_now) if req.client_now else datetime.now()
+        except ValueError:
+            now = datetime.now()
+
         if req.target_type == "day":
             target_date = (now + timedelta(days=req.target_index + 1)).date()
             target_noon = datetime.combine(
@@ -183,7 +222,7 @@ async def predict_point(req: PointPredictRequest):
 
         features, result, target_time = model_service.predict_point(
             current, temp_hist, hum_hist, rain_hist, cloud_hist, wind_hist,
-            hour_offset=hour_offset, forecast=forecast,
+            hour_offset=hour_offset, forecast=forecast, now=now,
         )
 
         feat_values = {
@@ -208,5 +247,7 @@ async def predict_point(req: PointPredictRequest):
             lime_features=lime_result,
         )
 
+    except HTTPException:
+        raise  # biarkan status code sengaja (mis. 503 model masih loading) apa adanya
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

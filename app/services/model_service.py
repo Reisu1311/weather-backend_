@@ -44,6 +44,7 @@ class ModelService:
         wind_history : list,
         hours        : int = 24,
         forecast     : dict | None = None,
+        now          : datetime | None = None,
     ) -> list:
         """Prediksi kondisi cuaca per jam (autoregressive).
 
@@ -83,7 +84,13 @@ class ModelService:
         rain_hist  = list(rain_history)
         cloud_hist = list(cloud_history)
         wind_hist  = list(wind_history)
-        now        = datetime.now()
+        # Bug fix: pakai jam yang dikirim KLIEN (HP pengguna), bukan jam
+        # server (`datetime.now()`) -- lihat penjelasan lengkap di
+        # `PredictRequest.client_now` (schemas/prediction.py). Server &
+        # HP bisa beda timezone, dan fitur "hour"/"hour_sin"/"hour_cos"
+        # di bawah butuh jam LOKAL pengguna yang sebenarnya, bukan jam
+        # server.
+        now = now or datetime.now()
 
         for h in range(1, hours + 1):
             idx         = h - 1
@@ -208,6 +215,7 @@ class ModelService:
         wind_history : list,
         days         : int = 7,
         forecast     : dict | None = None,
+        now          : datetime | None = None,
     ) -> list:
         """Prediksi kondisi cuaca harian.
 
@@ -220,8 +228,18 @@ class ModelService:
         popup LIME -- menyebabkan daftar "Prediksi Cuaca Per Hari" bisa
         menampilkan mis. "Mendung" sementara popup detail (yang diklik
         user) menunjukkan "Cerah" untuk hari yang sama.
+
+        Bug fix: `now` sekarang HARUS berasal dari jam di HP pengguna
+        (`client_now`), bukan jam server -- lihat penjelasan lengkap di
+        `PredictRequest.client_now`. Kalau backend menghitung "tanggal
+        besok" atau "jam 12 siang" pakai jamnya sendiri (server, biasa
+        UTC) sementara array `forecast` disusun Flutter mulai dari jam
+        di HP (WIB), titik jam 12:00 yang ditemukan bisa menunjuk ke
+        entri forecast yang salah -- persis penyebab nilai "Suhu" di
+        LIME (mis. 29.2°C) berbeda dari suhu jam 12:00 di header popup
+        (mis. 30.6°C).
         """
-        now = datetime.now()
+        now = now or datetime.now()
 
         # Hitung cukup jauh ke depan supaya mencakup jam 12:00 di hari
         # terakhir yang diminta.
@@ -234,7 +252,7 @@ class ModelService:
         hourly = self.predict_multi_hour(
             owm_current, temp_history, hum_history,
             rain_history, cloud_history, wind_history,
-            hours=max_hour_offset, forecast=forecast,
+            hours=max_hour_offset, forecast=forecast, now=now,
         )
 
         daily = []
@@ -294,6 +312,7 @@ class ModelService:
         hour_offset  : int,
         forecast     : dict | None = None,
         smooth       : bool = True,
+        now          : datetime | None = None,
     ):
         """Hitung fitur (40 fitur) + hasil prediksi untuk SATU titik waktu
         tertentu (hour_offset jam ke depan dari sekarang). Dipakai untuk
@@ -336,7 +355,9 @@ class ModelService:
         rain_hist  = list(rain_history)
         cloud_hist = list(cloud_history)
         wind_hist  = list(wind_history)
-        now        = datetime.now()
+        # Bug fix: pakai jam HP pengguna (client_now), bukan jam server --
+        # lihat penjelasan di predict_multi_hour/PredictRequest.client_now.
+        now = now or datetime.now()
 
         # Kalau smoothing aktif, kita perlu lanjut 1 jam lagi setelah
         # hour_offset supaya bisa tahu prediksi tetangga (hour_offset+1).
