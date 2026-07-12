@@ -217,25 +217,28 @@ class ModelService:
         forecast     : dict | None = None,
         now          : datetime | None = None,
     ) -> list:
-        """Prediksi kondisi cuaca harian -- REKAPAN PENUH satu hari (bukan
-        cuma titik jam 12:00 siang).
+        """Prediksi kondisi cuaca harian -- REKAP PENUH jam 06:00-18:00
+        (bukan cuma titik jam 12:00 siang, dan TIDAK dipecah jadi 2
+        segmen siang/malam -- selalu 1 kondisi per hari).
 
-        Untuk tiap hari, seluruh 24 jam prediksi (yang sudah dihaluskan
-        oleh `_smooth_hourly`) dibagi jadi 2 blok waktu:
-          - "Siang" : jam 06:00 - 17:59
-          - "Malam" : jam 18:00 - 23:59
-        Kondisi dominan (mode) dihitung terpisah untuk tiap blok.
+        Untuk tiap hari, dikumpulkan semua prediksi per jam (yang sudah
+        dihaluskan oleh `_smooth_hourly`) yang jatuh dalam rentang jam
+        06:00 s.d. 18:00 (jam-jam aktif/siang hari, kira-kira selaras
+        dengan waktu matahari terbit-terbenam di Makassar), lalu diambil
+        kondisi paling sering muncul (mode) + rata-rata confidence dari
+        rentang itu sebagai representasi "kondisi hari itu".
 
-        - Kalau kondisi dominan Siang == Malam -> hari itu dianggap
-          punya SATU kondisi cuaca sepanjang hari -> backend kirim 1
-          segmen saja (`segments` berisi 1 item, `label=None`).
-        - Kalau berbeda -> backend kirim 2 segmen ("Siang" & "Malam")
-          supaya Flutter bisa menampilkan keduanya (mis. "Siang: Cerah",
-          "Malam: Hujan").
+        Kenapa bukan cuma titik jam 12:00 (versi sebelumnya): satu titik
+        waktu tunggal rentan terhadap noise sesaat di jam itu saja.
+        Kenapa bukan 24 jam penuh (versi percobaan sebelumnya, dipecah
+        siang/malam): user memutuskan cukup 1 kondisi saja per hari,
+        dengan window 06:00-18:00 supaya representasinya condong ke
+        aktivitas siang hari yang lebih relevan buat user.
 
-        Field `condition`/`confidence` di level atas tetap disediakan
-        (= segmen pertama) untuk kompatibilitas kode lama yang belum
-        memakai `segments`.
+        Field `segments` tetap disediakan (isinya SELALU 1 item, label
+        None) supaya kompatibel dengan Flutter (`daily_screen.dart`)
+        yang sudah mendukung format ini -- tidak perlu ubah kode Flutter
+        sama sekali untuk versi ini.
 
         Bug fix `now`: HARUS berasal dari jam di HP pengguna
         (`client_now`), bukan jam server -- lihat penjelasan lengkap di
@@ -243,14 +246,13 @@ class ModelService:
         """
         now = now or datetime.now()
 
-        # Hitung cukup jauh ke depan supaya mencakup jam 23:00 di hari
-        # TERAKHIR yang diminta (butuh seluruh hari, bukan cuma sampai
-        # jam 12 siang saja seperti versi sebelumnya).
+        # Hitung cukup jauh ke depan supaya mencakup jam 18:00 di hari
+        # TERAKHIR yang diminta.
         last_day_date = (now + timedelta(days=days)).date()
-        last_day_end  = datetime.combine(
-            last_day_date, datetime.min.time()) + timedelta(hours=23)
+        last_day_18   = datetime.combine(
+            last_day_date, datetime.min.time()) + timedelta(hours=18)
         max_hour_offset = max(1, round(
-            (last_day_end - now).total_seconds() / 3600))
+            (last_day_18 - now).total_seconds() / 3600))
 
         hourly = self.predict_multi_hour(
             owm_current, temp_history, hum_history,
@@ -258,57 +260,44 @@ class ModelService:
             hours=max_hour_offset, forecast=forecast, now=now,
         )
 
-        def summarize(entries: list) -> tuple[str, float]:
-            """Mode kondisi + rata-rata confidence dari sekumpulan entri jam."""
-            if not entries:
-                return "Cerah Berawan", 0.5
-            counts = Counter(h["condition"] for h in entries)
-            cond, _ = counts.most_common(1)[0]
-            conf = float(np.mean(
-                [h["confidence"] for h in entries if h["condition"] == cond]))
-            return cond, conf
-
         daily = []
         for d in range(days):
             future_day  = now + timedelta(days=d + 1)
             target_date = future_day.date()
 
-            day_entries = [
+            # Semua entri jam 06:00-18:00 pada tanggal target.
+            window_entries = [
                 h for h in hourly
                 if datetime.fromisoformat(h["datetime"]).date() == target_date
+                and 6 <= datetime.fromisoformat(h["datetime"]).hour <= 18
             ]
-            siang_entries = [
-                h for h in day_entries
-                if 6 <= datetime.fromisoformat(h["datetime"]).hour <= 17
-            ]
-            malam_entries = [
-                h for h in day_entries
-                if datetime.fromisoformat(h["datetime"]).hour >= 18
-                or datetime.fromisoformat(h["datetime"]).hour < 6
-            ]
-
-            cond_siang, conf_siang = summarize(siang_entries or day_entries)
-            cond_malam, conf_malam = summarize(malam_entries or day_entries)
-
-            if cond_siang == cond_malam:
-                # Satu kondisi dominan sepanjang hari -> 1 segmen saja.
-                avg_conf = float(np.mean([conf_siang, conf_malam]))
-                segments = [
-                    {"label": None, "condition": cond_siang, "confidence": avg_conf},
+            # Fallback kalau window itu ternyata kosong (jarang -- hanya
+            # kalau rentang forecast terlalu pendek): pakai entri apapun
+            # yang ada pada tanggal itu.
+            if not window_entries:
+                window_entries = [
+                    h for h in hourly
+                    if datetime.fromisoformat(h["datetime"]).date() == target_date
                 ]
+
+            if window_entries:
+                counts = Counter(h["condition"] for h in window_entries)
+                condition, _ = counts.most_common(1)[0]
+                confidence = float(np.mean([
+                    h["confidence"] for h in window_entries
+                    if h["condition"] == condition
+                ]))
             else:
-                # Kondisi siang & malam berbeda -> 2 segmen terpisah.
-                segments = [
-                    {"label": "Siang", "condition": cond_siang, "confidence": conf_siang},
-                    {"label": "Malam", "condition": cond_malam, "confidence": conf_malam},
-                ]
+                condition, confidence = "Cerah Berawan", 0.5
 
             daily.append({
                 "day"       : future_day.strftime("%A"),
                 "date"      : target_date.strftime("%Y-%m-%d"),
-                "condition" : segments[0]["condition"],   # kompatibilitas lama
-                "confidence": segments[0]["confidence"],  # kompatibilitas lama
-                "segments"  : segments,
+                "condition" : condition,
+                "confidence": confidence,
+                "segments"  : [
+                    {"label": None, "condition": condition, "confidence": confidence},
+                ],
             })
         return daily
 
