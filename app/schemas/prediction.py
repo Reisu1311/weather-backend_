@@ -64,11 +64,21 @@ class HourlyPrediction(BaseModel):
     condition : str
     confidence: float
 
+class DailySegment(BaseModel):
+    """Satu segmen kondisi cuaca dalam sehari (mis. 'Siang' atau 'Malam').
+    Kalau kondisi siang & malam sama, backend hanya mengirim 1 segmen
+    (label=None) -- Flutter tampilkan 1 badge. Kalau beda, backend kirim
+    2 segmen -- Flutter tampilkan 2 badge berdampingan."""
+    label     : str | None  # "Siang" / "Malam" / None (kalau cuma 1 segmen)
+    condition : str
+    confidence: float
+
 class DailyPrediction(BaseModel):
     day       : str
     date      : str
-    condition : str
-    confidence: float
+    condition : str          # ringkasan utama (= segmen pertama, kompatibel lama)
+    confidence: float        # ringkasan utama (= segmen pertama, kompatibel lama)
+    segments  : List[DailySegment] = []
 
 class PredictResponse(BaseModel):
     current_condition: str

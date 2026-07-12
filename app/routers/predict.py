@@ -54,6 +54,24 @@ async def predict(req: PredictRequest):
         except ValueError:
             now = datetime.now()
 
+        # Bug fix TAMBAHAN: array `forecast_*` yang dikirim Flutter
+        # terikat ke JAM BULAT (Open-Meteo mengembalikan data per jam
+        # utuh: 23:00, 00:00, 01:00, ...), dan Flutter menyusunnya mulai
+        # dari "1 jam SETELAH jam bulat saat ini" (lihat komentar di
+        # `weather_remote_ds.dart`). Kalau di sini kita pakai `now` yang
+        # presisi sampai menit (mis. 23:50) untuk menghitung index array
+        # (`hour_offset`), hasilnya bisa meleset sampai hampir 1 jam dari
+        # entri yang SEBENARNYA ada di index itu -- persis penyebab nilai
+        # "Suhu" di LIME sedikit berbeda dari suhu di header popup.
+        #
+        # `now_floor` (jam dibulatkan ke bawah, menit/detik dibuang) ini
+        # dipakai KHUSUS untuk perhitungan yang berkaitan dengan index
+        # array forecast (predict_multi_hour/predict_multi_day/
+        # predict_point) -- BUKAN untuk fitur "current" di atas, yang
+        # tidak bergantung pada array sehingga tetap aman pakai `now`
+        # presisi.
+        now_floor = now.replace(minute=0, second=0, microsecond=0)
+
         # 3. Build fitur (40 fitur) untuk prediksi SAAT INI
         features = build_features(
             current, temp_hist, hum_hist,
@@ -81,7 +99,7 @@ async def predict(req: PredictRequest):
         hourly_raw = model_service.predict_multi_hour(
             current, temp_hist, hum_hist,
             rain_hist, cloud_hist, wind_hist, hours=24,
-            forecast=forecast, now=now,
+            forecast=forecast, now=now_floor,
         )
         hourly_out = [
             {
@@ -97,7 +115,7 @@ async def predict(req: PredictRequest):
         daily_raw = model_service.predict_multi_day(
             current, temp_hist, hum_hist,
             rain_hist, cloud_hist, wind_hist, days=7,
-            forecast=forecast, now=now,
+            forecast=forecast, now=now_floor,
         )
         daily_out = [
             {
@@ -106,6 +124,15 @@ async def predict(req: PredictRequest):
                 "condition" : CLASS_LABEL_ID.get(
                                 d["condition"], d["condition"]),
                 "confidence": d["confidence"],
+                "segments"  : [
+                    {
+                        "label"     : seg["label"],
+                        "condition" : CLASS_LABEL_ID.get(
+                                        seg["condition"], seg["condition"]),
+                        "confidence": seg["confidence"],
+                    }
+                    for seg in d["segments"]
+                ],
             }
             for d in daily_raw
         ]
@@ -211,18 +238,26 @@ async def predict_point(req: PointPredictRequest):
         except ValueError:
             now = datetime.now()
 
+        # Bug fix TAMBAHAN #2: sama seperti di /predict -- array `forecast`
+        # yang dikirim Flutter terikat ke JAM BULAT (lihat komentar di
+        # weather_remote_ds.dart & /predict di atas). `now_floor` (menit/
+        # detik dibuang) dipakai untuk perhitungan index array supaya
+        # konsisten dengan cara Flutter menyusun array itu, bukan `now`
+        # yang presisi sampai menit.
+        now_floor = now.replace(minute=0, second=0, microsecond=0)
+
         if req.target_type == "day":
-            target_date = (now + timedelta(days=req.target_index + 1)).date()
+            target_date = (now_floor + timedelta(days=req.target_index + 1)).date()
             target_noon = datetime.combine(
                 target_date, datetime.min.time()) + timedelta(hours=12)
             hour_offset = max(1, round(
-                (target_noon - now).total_seconds() / 3600))
+                (target_noon - now_floor).total_seconds() / 3600))
         else:
             hour_offset = req.target_index + 1
 
         features, result, target_time = model_service.predict_point(
             current, temp_hist, hum_hist, rain_hist, cloud_hist, wind_hist,
-            hour_offset=hour_offset, forecast=forecast, now=now,
+            hour_offset=hour_offset, forecast=forecast, now=now_floor,
         )
 
         feat_values = {

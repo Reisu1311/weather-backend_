@@ -217,37 +217,40 @@ class ModelService:
         forecast     : dict | None = None,
         now          : datetime | None = None,
     ) -> list:
-        """Prediksi kondisi cuaca harian.
+        """Prediksi kondisi cuaca harian -- REKAPAN PENUH satu hari (bukan
+        cuma titik jam 12:00 siang).
 
-        Diambil dari TITIK jam 12:00 siang (kalender) hari itu -- metode
-        yang SAMA PERSIS dengan `predict_point` (target_type="day") di
-        router. Ini penting: sebelumnya fungsi ini mengambil MODE (kondisi
-        paling sering muncul) dari rolling window 24 jam yang dihitung
-        mulai dari SAAT REQUEST dibuat (bukan dari tengah malam kalender),
-        yang seringkali berbeda dari titik jam 12 siang yang dijelaskan
-        popup LIME -- menyebabkan daftar "Prediksi Cuaca Per Hari" bisa
-        menampilkan mis. "Mendung" sementara popup detail (yang diklik
-        user) menunjukkan "Cerah" untuk hari yang sama.
+        Untuk tiap hari, seluruh 24 jam prediksi (yang sudah dihaluskan
+        oleh `_smooth_hourly`) dibagi jadi 2 blok waktu:
+          - "Siang" : jam 06:00 - 17:59
+          - "Malam" : jam 18:00 - 23:59
+        Kondisi dominan (mode) dihitung terpisah untuk tiap blok.
 
-        Bug fix: `now` sekarang HARUS berasal dari jam di HP pengguna
+        - Kalau kondisi dominan Siang == Malam -> hari itu dianggap
+          punya SATU kondisi cuaca sepanjang hari -> backend kirim 1
+          segmen saja (`segments` berisi 1 item, `label=None`).
+        - Kalau berbeda -> backend kirim 2 segmen ("Siang" & "Malam")
+          supaya Flutter bisa menampilkan keduanya (mis. "Siang: Cerah",
+          "Malam: Hujan").
+
+        Field `condition`/`confidence` di level atas tetap disediakan
+        (= segmen pertama) untuk kompatibilitas kode lama yang belum
+        memakai `segments`.
+
+        Bug fix `now`: HARUS berasal dari jam di HP pengguna
         (`client_now`), bukan jam server -- lihat penjelasan lengkap di
-        `PredictRequest.client_now`. Kalau backend menghitung "tanggal
-        besok" atau "jam 12 siang" pakai jamnya sendiri (server, biasa
-        UTC) sementara array `forecast` disusun Flutter mulai dari jam
-        di HP (WIB), titik jam 12:00 yang ditemukan bisa menunjuk ke
-        entri forecast yang salah -- persis penyebab nilai "Suhu" di
-        LIME (mis. 29.2°C) berbeda dari suhu jam 12:00 di header popup
-        (mis. 30.6°C).
+        `PredictRequest.client_now` (schemas/prediction.py).
         """
         now = now or datetime.now()
 
-        # Hitung cukup jauh ke depan supaya mencakup jam 12:00 di hari
-        # terakhir yang diminta.
+        # Hitung cukup jauh ke depan supaya mencakup jam 23:00 di hari
+        # TERAKHIR yang diminta (butuh seluruh hari, bukan cuma sampai
+        # jam 12 siang saja seperti versi sebelumnya).
         last_day_date = (now + timedelta(days=days)).date()
-        last_noon = datetime.combine(
-            last_day_date, datetime.min.time()) + timedelta(hours=12)
+        last_day_end  = datetime.combine(
+            last_day_date, datetime.min.time()) + timedelta(hours=23)
         max_hour_offset = max(1, round(
-            (last_noon - now).total_seconds() / 3600))
+            (last_day_end - now).total_seconds() / 3600))
 
         hourly = self.predict_multi_hour(
             owm_current, temp_history, hum_history,
@@ -255,49 +258,57 @@ class ModelService:
             hours=max_hour_offset, forecast=forecast, now=now,
         )
 
+        def summarize(entries: list) -> tuple[str, float]:
+            """Mode kondisi + rata-rata confidence dari sekumpulan entri jam."""
+            if not entries:
+                return "Cerah Berawan", 0.5
+            counts = Counter(h["condition"] for h in entries)
+            cond, _ = counts.most_common(1)[0]
+            conf = float(np.mean(
+                [h["confidence"] for h in entries if h["condition"] == cond]))
+            return cond, conf
+
         daily = []
         for d in range(days):
             future_day  = now + timedelta(days=d + 1)
             target_date = future_day.date()
 
-            # Cari entri jam 12:00 TEPAT pada tanggal target.
-            point = None
-            for h in hourly:
-                h_dt = datetime.fromisoformat(h["datetime"])
-                if h_dt.date() == target_date and h_dt.hour == 12:
-                    point = h
-                    break
+            day_entries = [
+                h for h in hourly
+                if datetime.fromisoformat(h["datetime"]).date() == target_date
+            ]
+            siang_entries = [
+                h for h in day_entries
+                if 6 <= datetime.fromisoformat(h["datetime"]).hour <= 17
+            ]
+            malam_entries = [
+                h for h in day_entries
+                if datetime.fromisoformat(h["datetime"]).hour >= 18
+                or datetime.fromisoformat(h["datetime"]).hour < 6
+            ]
 
-            # Fallback: kalau titik jam 12 persis tidak ada (jarang --
-            # hanya kalau rentang forecast terlalu pendek), ambil entri
-            # terdekat pada tanggal yang sama; kalau tetap tidak ada,
-            # fallback ke mode 24-jam seperti pendekatan lama.
-            if point is None:
-                closest, closest_diff = None, 999
-                for h in hourly:
-                    h_dt = datetime.fromisoformat(h["datetime"])
-                    if h_dt.date() == target_date:
-                        diff = abs(h_dt.hour - 12)
-                        if diff < closest_diff:
-                            closest_diff = diff
-                            closest = h
-                point = closest
+            cond_siang, conf_siang = summarize(siang_entries or day_entries)
+            cond_malam, conf_malam = summarize(malam_entries or day_entries)
 
-            if point is not None:
-                condition  = point["condition"]
-                confidence = point["confidence"]
+            if cond_siang == cond_malam:
+                # Satu kondisi dominan sepanjang hari -> 1 segmen saja.
+                avg_conf = float(np.mean([conf_siang, conf_malam]))
+                segments = [
+                    {"label": None, "condition": cond_siang, "confidence": avg_conf},
+                ]
             else:
-                day_data   = hourly[d * 24 : (d + 1) * 24]
-                conditions = [h["condition"] for h in day_data] or ["Cerah Berawan"]
-                condition  = Counter(conditions).most_common(1)[0][0]
-                confidence = float(np.mean(
-                    [h["confidence"] for h in day_data])) if day_data else 0.5
+                # Kondisi siang & malam berbeda -> 2 segmen terpisah.
+                segments = [
+                    {"label": "Siang", "condition": cond_siang, "confidence": conf_siang},
+                    {"label": "Malam", "condition": cond_malam, "confidence": conf_malam},
+                ]
 
             daily.append({
                 "day"       : future_day.strftime("%A"),
                 "date"      : target_date.strftime("%Y-%m-%d"),
-                "condition" : condition,
-                "confidence": confidence,
+                "condition" : segments[0]["condition"],   # kompatibilitas lama
+                "confidence": segments[0]["confidence"],  # kompatibilitas lama
+                "segments"  : segments,
             })
         return daily
 
