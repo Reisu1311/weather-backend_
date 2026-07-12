@@ -260,6 +260,31 @@ async def predict_point(req: PointPredictRequest):
             hour_offset=hour_offset, forecast=forecast, now=now_floor,
         )
 
+        # Bug fix: daftar harian (predict_multi_day) menghitung kondisi
+        # dari REKAP PENUH 24 JAM, sementara predict_point di atas cuma
+        # menghitung SATU titik (jam 12:00). Kalau keduanya dibiarkan
+        # jalan sendiri-sendiri, kondisi yang tampil di popup bisa beda
+        # dari yang tampil di daftar untuk hari yang sama persis --
+        # inilah "ngebug lagi" yang dimaksud.
+        #
+        # Untuk "day", override "condition"/"confidence" di sini supaya
+        # SAMA PERSIS dengan yang dihitung predict_multi_day (satu-
+        # satunya sumber kebenaran untuk kondisi harian). `features`
+        # (titik jam 12:00) tetap dipakai apa adanya untuk menjelaskan
+        # LIME & menampilkan data mentah -- cuma label kondisi & badge
+        # keyakinan yang disamakan dengan daftar.
+        if req.target_type == "day":
+            daily_recap = model_service.predict_multi_day(
+                current, temp_hist, hum_hist,
+                rain_hist, cloud_hist, wind_hist,
+                days=req.target_index + 1,
+                forecast=forecast, now=now_floor,
+            )
+            if daily_recap:
+                result = dict(result)  # jangan ubah dict asli
+                result["condition"]  = daily_recap[-1]["condition"]
+                result["confidence"] = daily_recap[-1]["confidence"]
+
         feat_values = {
             FEATURES[i]: float(features[0][i])
             for i in range(len(FEATURES))

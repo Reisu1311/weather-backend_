@@ -217,28 +217,21 @@ class ModelService:
         forecast     : dict | None = None,
         now          : datetime | None = None,
     ) -> list:
-        """Prediksi kondisi cuaca harian -- REKAP PENUH jam 06:00-18:00
-        (bukan cuma titik jam 12:00 siang, dan TIDAK dipecah jadi 2
-        segmen siang/malam -- selalu 1 kondisi per hari).
+        """Prediksi kondisi cuaca harian -- REKAP PENUH 24 JAM (00:00-23:00)
+        per hari, bukan cuma titik jam 12:00 siang.
 
-        Untuk tiap hari, dikumpulkan semua prediksi per jam (yang sudah
-        dihaluskan oleh `_smooth_hourly`) yang jatuh dalam rentang jam
-        06:00 s.d. 18:00 (jam-jam aktif/siang hari, kira-kira selaras
-        dengan waktu matahari terbit-terbenam di Makassar), lalu diambil
+        Untuk tiap hari, dikumpulkan SEMUA prediksi per jam (yang sudah
+        dihaluskan oleh `_smooth_hourly`) pada tanggal itu, lalu diambil
         kondisi paling sering muncul (mode) + rata-rata confidence dari
-        rentang itu sebagai representasi "kondisi hari itu".
-
-        Kenapa bukan cuma titik jam 12:00 (versi sebelumnya): satu titik
-        waktu tunggal rentan terhadap noise sesaat di jam itu saja.
-        Kenapa bukan 24 jam penuh (versi percobaan sebelumnya, dipecah
-        siang/malam): user memutuskan cukup 1 kondisi saja per hari,
-        dengan window 06:00-18:00 supaya representasinya condong ke
-        aktivitas siang hari yang lebih relevan buat user.
+        seluruh 24 jam sebagai representasi "kondisi hari itu". Ini satu-
+        satunya sumber kebenaran untuk kondisi harian -- popup LIME
+        (`/predict/point` di router, target_type="day") ikut memakai
+        hasil dari fungsi ini juga (bukan menghitung ulang sendiri),
+        supaya daftar & popup TIDAK PERNAH menampilkan kondisi berbeda
+        untuk hari yang sama.
 
         Field `segments` tetap disediakan (isinya SELALU 1 item, label
-        None) supaya kompatibel dengan Flutter (`daily_screen.dart`)
-        yang sudah mendukung format ini -- tidak perlu ubah kode Flutter
-        sama sekali untuk versi ini.
+        None) supaya kompatibel dengan Flutter (`daily_screen.dart`).
 
         Bug fix `now`: HARUS berasal dari jam di HP pengguna
         (`client_now`), bukan jam server -- lihat penjelasan lengkap di
@@ -246,8 +239,82 @@ class ModelService:
         """
         now = now or datetime.now()
 
-        # Hitung cukup jauh ke depan supaya mencakup jam 18:00 di hari
-        # TERAKHIR yang diminta.
+        # Hitung cukup jauh ke depan supaya mencakup jam 23:00 di hari
+        # TERAKHIR yang diminta (butuh seluruh 24 jam tiap hari).
+        last_day_date = (now + timedelta(days=days)).date()
+        last_day_end  = datetime.combine(
+            last_day_date, datetime.min.time()) + timedelta(hours=23)
+        max_hour_offset = max(1, round(
+            (last_day_end - now).total_seconds() / 3600))
+
+        hourly = self.predict_multi_hour(
+            owm_current, temp_history, hum_history,
+            rain_history, cloud_history, wind_history,
+            hours=max_hour_offset, forecast=forecast, now=now,
+        )
+
+        daily = []
+        for d in range(days):
+            future_day  = now + timedelta(days=d + 1)
+            target_date = future_day.date()
+
+            # SEMUA entri (24 jam) pada tanggal target.
+            day_entries = [
+                h for h in hourly
+                if datetime.fromisoformat(h["datetime"]).date() == target_date
+            ]
+
+            if day_entries:
+                counts = Counter(h["condition"] for h in day_entries)
+                condition, _ = counts.most_common(1)[0]
+                confidence = float(np.mean([
+                    h["confidence"] for h in day_entries
+                    if h["condition"] == condition
+                ]))
+            else:
+                condition, confidence = "Cerah Berawan", 0.5
+
+            daily.append({
+                "day"       : future_day.strftime("%A"),
+                "date"      : target_date.strftime("%Y-%m-%d"),
+                "condition" : condition,
+                "confidence": confidence,
+                "segments"  : [
+                    {"label": None, "condition": condition, "confidence": confidence},
+                ],
+            })
+        return daily
+
+    def predict_multi_day_full_recap(
+        self,
+        owm_current  : dict,
+        temp_history : list,
+        hum_history  : list,
+        rain_history : list,
+        cloud_history: list,
+        wind_history : list,
+        days         : int = 7,
+        forecast     : dict | None = None,
+        now          : datetime | None = None,
+    ) -> list:
+        """[ALTERNATIF, TIDAK DIPAKAI SECARA DEFAULT]
+
+        Prediksi kondisi cuaca harian -- REKAP PENUH jam 06:00-18:00
+        (mode dari semua prediksi per jam di rentang itu), bukan cuma
+        titik jam 12:00 siang. Untuk mengaktifkan versi ini, di
+        `routers/predict.py` ganti pemanggilan:
+            model_service.predict_multi_day(...)
+        menjadi:
+            model_service.predict_multi_day_full_recap(...)
+        (parameter yang diterima identik, tidak perlu ubah argumen lain).
+
+        Catatan: kalau versi ini dipakai, popup LIME (predict_point, yang
+        masih menjelaskan titik jam 12:00 saja) bisa jadi tidak 100%
+        sinkron dengan daftar harian di sini pada beberapa hari (karena
+        keduanya pakai metode berbeda: titik vs rekap rentang jam).
+        """
+        now = now or datetime.now()
+
         last_day_date = (now + timedelta(days=days)).date()
         last_day_18   = datetime.combine(
             last_day_date, datetime.min.time()) + timedelta(hours=18)
@@ -265,15 +332,11 @@ class ModelService:
             future_day  = now + timedelta(days=d + 1)
             target_date = future_day.date()
 
-            # Semua entri jam 06:00-18:00 pada tanggal target.
             window_entries = [
                 h for h in hourly
                 if datetime.fromisoformat(h["datetime"]).date() == target_date
                 and 6 <= datetime.fromisoformat(h["datetime"]).hour <= 18
             ]
-            # Fallback kalau window itu ternyata kosong (jarang -- hanya
-            # kalau rentang forecast terlalu pendek): pakai entri apapun
-            # yang ada pada tanggal itu.
             if not window_entries:
                 window_entries = [
                     h for h in hourly
